@@ -23,10 +23,10 @@ class RandomApply(nn.Module):
 
 def default_augmentation(image_size: Tuple[int, int] = (32, 32)) -> nn.Module:
     return nn.Sequential(
-        aug.RandomHorizontalFlip(),
+        # aug.RandomHorizontalFlip(),
         aug.RandomCrop(size=image_size, padding=4, padding_mode='reflect'),
-        aug.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
-        aug.RandomGrayscale(p=0.1),
+        # aug.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
+        # aug.RandomGrayscale(p=0.1),
     )
 
 class BarlowTwinsLoss(nn.Module):
@@ -43,11 +43,13 @@ class BarlowTwinsLoss(nn.Module):
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
     def forward(self, z1, z2):
+        assert z1.shape == z2.shape
         # N x D, where N is the batch size and D is output dim of projection head
         z1_norm = (z1 - torch.mean(z1, dim=0)) / torch.std(z1, dim=0)
         z2_norm = (z2 - torch.mean(z2, dim=0)) / torch.std(z2, dim=0)
 
-        cross_corr = torch.matmul(z1_norm.T, z2_norm) / self.batch_size
+        # cross_corr = torch.matmul(z1_norm.T, z2_norm) / self.batch_size
+        cross_corr = torch.matmul(z1_norm.T, z2_norm) / z1.shape[0]
 
         on_diag = torch.diagonal(cross_corr).add_(-1).pow_(2).sum()
         off_diag = self.off_diagonal_ele(cross_corr).pow_(2).sum()
@@ -87,17 +89,15 @@ class barlowBYOL(pl.LightningModule):
         self.projection_head = ProjectionHead(input_dim=encoder_out_dim)
         self._target = None
 
-        self.loss = BarlowTwinsLoss(batch_size=256)
-
-        # Create and initialize the projector with a dummy tensor
-        # self.online(torch.zeros(2,3, *image_size))
+        self.loss = BarlowTwinsLoss(batch_size=16)
 
     @property
     def target(self):
         if self._target is None:
             target_encoder = deepcopy(self.encoder)
             target_projection_head = deepcopy(self.projection_head)
-        return nn.Sequential(target_encoder, target_projection_head)
+            self._target = nn.Sequential(target_encoder, target_projection_head)
+        return self._target
     
     def forward(self, x):
         return self.encoder(x)
@@ -107,12 +107,11 @@ class barlowBYOL(pl.LightningModule):
 
         with torch.no_grad():
             x1, x2 = self.augment(x), self.augment(x)
-            target_y = self.projection_head(self.encoder(x2))
+            target_y = self.target(x2)
         y = self.projection_head(self.encoder(x1))
 
         loss = self.loss(y, target_y)
         self.log("train_loss", loss, on_step=True, on_epoch=False)
-        print(f'\nTrain loss: {loss}')
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -120,10 +119,10 @@ class barlowBYOL(pl.LightningModule):
 
         with torch.no_grad():
             x1, x2 = self.augment(x), self.augment(x)
-            target_y = self.projection_head(self.encoder(x2))
-        y = self.projection_head(self.encoder(x1))
+            target_y = self.target(x2)
+            y = self.projection_head(self.encoder(x1))
 
-        loss = self.loss(y, target_y)
+            loss = self.loss(y, target_y)
 
         self.log("val_loss", loss, on_step=False, on_epoch=True)
     
