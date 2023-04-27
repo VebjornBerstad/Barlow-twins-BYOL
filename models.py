@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics.functional import accuracy
 
+from torchvision import transforms
+
 import pytorch_lightning as pl
 
 from copy import deepcopy
@@ -10,24 +12,50 @@ from typing import Callable, Tuple, Sequence, Union
 
 from kornia import augmentation as aug
 
+import numpy as np
 import random
+from functools import partial
 
-class RandomApply(nn.Module):
-    def __init__(self, fn: Callable, p: float):
-        super().__init__()
-        self.fn = fn
-        self.p = p
+class MixUpAugmentation(nn.Module):
+    def __init__(self, alpha=0.4):
+        super(MixUpAugmentation, self).__init__()
+        self.alpha = alpha
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x if random.random() > self.p else self.fn(x)
+    def forward(self, x):
+        batch_size = x.size(0)
+        lam = np.random.beta(self.alpha, self.alpha)
 
-def default_augmentation(image_size: Tuple[int, int] = (32, 32)) -> nn.Module:
-    return nn.Sequential(
-        # aug.RandomHorizontalFlip(),
-        aug.RandomCrop(size=image_size, padding=4, padding_mode='reflect'),
-        # aug.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
-        # aug.RandomGrayscale(p=0.1),
+        index = torch.randperm(batch_size).to(x.device)
+        x_exp = torch.exp(x)
+        x_exp_k = torch.exp(x[index])
+
+        mixed_x = torch.log((1 - lam) * x_exp + lam * x_exp_k)
+
+        return mixed_x
+    
+class BatchNormalize(nn.Module):
+    def __init__(self, eps=1e-5):
+        super(BatchNormalize, self).__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        min_val = 0
+        max_val = 255
+        mean = torch.mean(x, dim=(0, 2, 3), keepdim=True)
+        std = torch.std(x, dim=(0, 2, 3), unbiased=False, keepdim=True) + self.eps
+        mean = (mean-min_val)/(max_val-min_val)
+        std = std/(max_val-min_val)
+        x_normalized = (x - mean) / std
+        return x_normalized
+
+def augmentation_pipeline(image_size=(128, 216), mixup_alpha=0.1):
+    pipeline = nn.Sequential(
+        # transforms.RandomApply([RandomMixUp(alpha=mixup_alpha)], p=1),
+        # MixUpAugmentation(alpha=0.01),
+        transforms.RandomApply([transforms.RandomResizedCrop(size=image_size, scale=(0.5, 1), antialias=None)], p=1),
+        BatchNormalize()
     )
+    return pipeline
 
 class BarlowTwinsLoss(nn.Module):
     def __init__(self, batch_size, lambda_coeff=5e-3, z_dim=128):
@@ -55,6 +83,30 @@ class BarlowTwinsLoss(nn.Module):
         off_diag = self.off_diagonal_ele(cross_corr).pow_(2).sum()
 
         return on_diag + self.lambda_coeff * off_diag
+    
+
+class ConvNet(nn.Module):
+    def __init__(self, in_channels=1, out_features=128):
+        super(ConvNet, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1)
+        self.relu1 = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.fc = nn.Linear(64*54*32, out_features)
+        # self.sigmoid =nn.Sigmoid()
+        # self.batch = nn.BatchNorm1d(out_features)
+
+    def forward(self, x):
+        x = self.pool1(self.relu1(self.conv1(x)))
+        x = self.pool2(self.relu2(self.conv2(x)))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        # x = self.batch(x)
+        return x
 
 class ProjectionHead(nn.Module):
     def __init__(self, input_dim=2048, hidden_dim=2048, output_dim=128):
@@ -73,14 +125,14 @@ class ProjectionHead(nn.Module):
 class barlowBYOL(pl.LightningModule):
     def __init__(self, 
                  encoder, 
-                 encoder_out_dim, 
+                 encoder_out_dim,
                  image_size: Tuple[int, int], 
                  lr=3e-4, 
-                 tau=0.99,
+                 tau=0.99
                  ):
         
         super().__init__()
-        self.augment = default_augmentation(image_size)
+        self.augment = augmentation_pipeline(image_size=image_size, mixup_alpha=0.01)
 
         self.lr = lr
         self.tau = tau
@@ -89,7 +141,7 @@ class barlowBYOL(pl.LightningModule):
         self.projection_head = ProjectionHead(input_dim=encoder_out_dim)
         self._target = None
 
-        self.loss = BarlowTwinsLoss(batch_size=16)
+        self.loss = BarlowTwinsLoss(batch_size=64)
 
     @property
     def target(self):
@@ -129,7 +181,7 @@ class barlowBYOL(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         return optimizer
-    
+        
     def on_after_backward(self):
         for online_param, target_param in zip(self.encoder.parameters(), self.target[0].parameters()):
             target_param.data = target_param.data * self.tau + online_param.data * (1 - self.tau)
@@ -206,3 +258,8 @@ class LinearEvaluationCallback(pl.Callback):
         acc = accuracy(pred_labels, y, task="multiclass", num_classes=10)
         pl_module.log("online_val_acc", acc, on_step=False, on_epoch=True, sync_dist=True)
         pl_module.log("online_val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
+
+class RunningLoss(pl.Callback):
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        pl_module.running_loss = 0.0
+        pl_module.loss_count = 0.0

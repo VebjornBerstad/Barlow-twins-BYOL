@@ -1,4 +1,4 @@
-from models import barlowBYOL, LinearEvaluationCallback
+from models import barlowBYOL, LinearEvaluationCallback, ConvNet, RunningLoss
 from dataset import CustomImageDataset
 
 import torchvision.transforms as transforms
@@ -17,14 +17,16 @@ import matplotlib.pyplot as plt
 
 def main():
 
+    mean = 0.4403
+    std = 0.1809
     transform = transforms.Compose([
-        # transforms.Resize((128, 256)),
+        # transforms.Resize((216, 128)),
         transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5])
+        transforms.Normalize([mean], [std])
         ])
     
     root_dir = './mel_spectrogram'
-    batch_size = 16
+    batch_size = 64
 
     # Create the custom dataset
     dataset = CustomImageDataset(root_dir, transform=transform)
@@ -35,36 +37,30 @@ def main():
     train_dataset, val_dataset = random_split(dataset, [train_size, valid_size])
 
     # Create DataLoaders for the train and validation sets
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=True)
 
-    # Load the CIFAR-10 dataset
-    # train_dataset = CIFAR10(root='./data', train=True, download=True, transform=transform)
-    # val_dataset = CIFAR10(root='./data', train=False, download=True, transform=transform)
-    # train_dataloader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=4, pin_memory=True)
-    # val_dataloader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
+    # encoder = resnet18()
+    # encoder.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    # encoder.maxpool = nn.MaxPool2d(kernel_size=1, stride=1)
+    # encoder.fc = nn.Identity()
 
-    encoder = resnet18()
-    encoder.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    encoder.maxpool = nn.MaxPool2d(kernel_size=1, stride=1)
-    encoder.fc = nn.Identity()
-
-    # Load the barlowBYOL model and train it
+    encoder = ConvNet(in_channels=1, out_features=512)
 
     logger = TensorBoardLogger("logs", name="Barlow_BYOL")
     
-    barlow_byol = barlowBYOL(encoder=encoder, image_size=(216, 128), lr=3e-4, tau=0.99, encoder_out_dim=512)
+    barlow_byol = barlowBYOL(encoder=encoder, image_size=(128, 216), lr=1e-4, tau=0.99, encoder_out_dim=512)
 
     linear_evaluation = LinearEvaluationCallback(encoder_output_dim=512, num_classes=10)
-    checkpoint_callback = ModelCheckpoint(every_n_epochs=100, save_top_k=-1, save_last=True)
+    checkpoint_callback = ModelCheckpoint(every_n_epochs=50, save_top_k=-1, save_last=True)
 
     barlow_byol_trainer = Trainer(
         devices=1,
         accelerator='gpu',
         max_epochs=500,
         callbacks=[linear_evaluation, checkpoint_callback],
-        logger=logger,
-        log_every_n_steps=1
+        logger=logger,  
+        # log_every_n_steps=10
         )
     barlow_byol_trainer.fit(barlow_byol, train_dataloader, val_dataloader)
 
